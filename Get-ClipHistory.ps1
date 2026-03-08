@@ -26,6 +26,9 @@ param(
     [switch]$All
 )
 
+# Configuration
+$MaxDisplayLines = 8
+
 # --- PowerShell Core Shim ---
 # Windows Clipboard History API (WinRT) is natively accessible in Windows PowerShell 5.1.
 # PowerShell 7+ (Core) requires complex interop setup to access these APIs directly.
@@ -225,9 +228,24 @@ foreach ($item in $items) {
 }
 
 if ($All) {
+    $ESC = [char]27
+    $Cyan = "$ESC[36m"
+    $DarkGray = "$ESC[90m"
+    $Reset = "$ESC[0m"
+
     for ($i = 0; $i -lt $collection.Count; $i++) {
-        Write-Host "[$i]" -ForegroundColor Cyan -NoNewline
-        Write-Host " $($collection[$i])"
+        $outputString = $Cyan + "[$i]" + $Reset
+        
+        $lines = $collection[$i] -split '\r?\n'
+        if ($lines.Count -gt $MaxDisplayLines) {
+            $preview = $lines[0..($MaxDisplayLines - 1)] -join "`n"
+            $outputString += " $preview`n"
+            $outputString += "$DarkGray... ($($lines.Count - $MaxDisplayLines) more lines truncated)$Reset"
+        } else {
+            $outputString += " $($collection[$i])"
+        }
+
+        Write-Output $outputString
     }
     return
 } else {
