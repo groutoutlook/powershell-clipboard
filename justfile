@@ -14,10 +14,15 @@ _default:
 alias b := build
 [group('dev')]
 build:
-    # build task here
+    @echo "No build step required"
 
 alias r := run
-default_args := 'args here'
+default_args := '-Help'
+
+[group('dev')]
+run *args:
+    pwsh.exe -File ./Get-ClipHistory.ps1 {{ if args == '' { default_args } else { args } }}
+
 [group('debug')]
 run args=default_args:
     @Write-Host {{default_args}} -ForegroundColor Red
