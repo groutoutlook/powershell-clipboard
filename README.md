@@ -10,7 +10,19 @@ Small scripts for reading Windows clipboard history and restoring items back int
 
 ## Usage
 
-List available history items:
+Preview the first 20 history items:
+
+```powershell
+.\Get-ClipHistory.ps1
+```
+
+Change the preview length:
+
+```powershell
+.\Get-ClipHistory.ps1 -PreviewCount 30
+```
+
+List all available history items:
 
 ```powershell
 .\Get-ClipHistory.ps1 -All
