@@ -19,7 +19,7 @@ function Convert-BoundParametersToArgumentList {
         $arguments += "-$($entry.Key)"
 
         if ($entry.Value -is [System.Array]) {
-            $arguments += ($entry.Value -join ',')
+            $arguments += @($entry.Value | ForEach-Object { [string]$_ })
             continue
         }
 
@@ -45,6 +45,7 @@ function Invoke-WindowsPowerShellShim {
 
     $arguments = @(
         '-NoProfile'
+        '-STA'
         '-ExecutionPolicy'
         'Bypass'
         '-File'
@@ -334,4 +335,54 @@ function Set-ClipboardFromHistoryEntry {
     $clipboardType::SetContent($package)
     $clipboardType::Flush()
     return $Entry
+}
+
+function Resolve-ClipboardFileSystemPaths {
+    param([string[]]$Path)
+
+    $resolvedPaths = @()
+
+    foreach ($item in $Path) {
+        foreach ($resolved in @(Resolve-Path -LiteralPath $item -ErrorAction Stop)) {
+            if ($resolved.Provider.Name -ne 'FileSystem') {
+                throw "Path '$item' is not a file system path."
+            }
+
+            $resolvedPaths += [System.IO.Path]::GetFullPath($resolved.ProviderPath)
+        }
+    }
+
+    return @($resolvedPaths | Select-Object -Unique)
+}
+
+function Set-ClipboardFileDropList {
+    param(
+        [string[]]$Path,
+        [ValidateSet('Copy', 'Cut')]
+        [string]$Operation = 'Copy'
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+
+    $resolvedPaths = @(Resolve-ClipboardFileSystemPaths -Path $Path)
+    if ($resolvedPaths.Count -eq 0) {
+        throw 'No file system paths were resolved.'
+    }
+
+    $dropList = [System.Collections.Specialized.StringCollection]::new()
+    $dropList.AddRange([string[]]$resolvedPaths)
+
+    $dataObject = [System.Windows.Forms.DataObject]::new()
+    $dataObject.SetFileDropList($dropList)
+
+    $effectBytes = if ($Operation -eq 'Cut') {
+        [byte[]](2, 0, 0, 0)
+    } else {
+        [byte[]](5, 0, 0, 0)
+    }
+
+    $dataObject.SetData('Preferred DropEffect', [System.IO.MemoryStream]::new($effectBytes))
+    [System.Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
+
+    return @($resolvedPaths)
 }

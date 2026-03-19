@@ -51,3 +51,21 @@ Preview what would be restored without changing the clipboard:
 ```powershell
 .\Set-ClipHistory.ps1 -Index 1 -WhatIf
 ```
+
+Put a file or folder on the clipboard the same way Explorer does when you press Ctrl+C:
+
+```powershell
+.\set-fileClipboard.ps1 .\README.md
+```
+
+Mark a file or folder as a cut operation instead of copy:
+
+```powershell
+.\set-fileClipboard.ps1 .\README.md -Cut
+```
+
+Copy multiple paths in one call:
+
+```powershell
+.\set-fileClipboard.ps1 .\Get-ClipHistory.ps1, .\Set-ClipHistory.ps1
+```
