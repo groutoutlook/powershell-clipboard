@@ -69,3 +69,11 @@ Copy multiple paths in one call:
 ```powershell
 .\set-fileClipboard.ps1 .\Get-ClipHistory.ps1, .\Set-ClipHistory.ps1
 ```
+
+Reuse whatever is already on the clipboard when it contains copied files or valid text paths:
+
+```powershell
+.\set-fileClipboard.ps1
+```
+
+If the clipboard contains plain text, images, or other content that cannot be resolved to existing file system paths, the script stops with a clear error instead of trying to copy invalid data.

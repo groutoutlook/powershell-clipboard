@@ -337,6 +337,55 @@ function Set-ClipboardFromHistoryEntry {
     return $Entry
 }
 
+function Convert-ClipboardTextToPathCandidates {
+    param([string]$Text)
+
+    $candidates = @()
+
+    foreach ($line in @($Text -split '\r?\n')) {
+        $candidate = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        if ($candidate.Length -ge 2 -and $candidate.StartsWith('"') -and $candidate.EndsWith('"')) {
+            $candidate = $candidate.Substring(1, $candidate.Length - 2)
+        }
+
+        $candidates += $candidate
+    }
+
+    return @($candidates)
+}
+
+function Get-ClipboardCopyCandidatePaths {
+    Add-Type -AssemblyName System.Windows.Forms
+
+    if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+        return @([string[]][System.Windows.Forms.Clipboard]::GetFileDropList())
+    }
+
+    if (-not [System.Windows.Forms.Clipboard]::ContainsText()) {
+        throw 'Clipboard does not contain copied files or folders. Copy items in Explorer, copy text paths, or pass -Path explicitly.'
+    }
+
+    $text = [System.Windows.Forms.Clipboard]::GetText()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'Clipboard text is empty and is not suitable for Explorer copy. Copy one or more files or folders, or pass -Path explicitly.'
+    }
+
+    $candidates = @(Convert-ClipboardTextToPathCandidates -Text $text)
+    if ($candidates.Count -eq 0) {
+        throw 'Clipboard text did not contain any usable file or folder paths. Copy items in Explorer, copy text paths, or pass -Path explicitly.'
+    }
+
+    try {
+        return @(Resolve-ClipboardFileSystemPaths -Path $candidates)
+    } catch {
+        throw "Clipboard text is not suitable for Explorer copy. Copy existing files or folders, or pass -Path explicitly. $($_.Exception.Message)"
+    }
+}
+
 function Resolve-ClipboardFileSystemPaths {
     param([string[]]$Path)
 

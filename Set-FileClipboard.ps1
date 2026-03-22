@@ -5,7 +5,7 @@
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [Parameter(Mandatory, Position = 0)]
+    [Parameter(Position = 0)]
     [Alias('LiteralPath', 'FullName', 'PSPath')]
     [string[]]$Path,
 
@@ -20,16 +20,19 @@ param(
 
 [void](Invoke-WindowsPowerShellShim -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters)
 
-$inputPaths = [string[]]@($Path)
-
-if ($inputPaths.Count -eq 0) {
-    return
-}
-
 $operation = if ($Cut) { 'Cut' } else { 'Copy' }
 
 try {
-    $resolvedPaths = @(Resolve-ClipboardFileSystemPaths -Path $inputPaths)
+    if ($PSBoundParameters.ContainsKey('Path')) {
+        $inputPaths = [string[]]@($Path)
+        if ($inputPaths.Count -eq 0) {
+            return
+        }
+
+        $resolvedPaths = @(Resolve-ClipboardFileSystemPaths -Path $inputPaths)
+    } else {
+        $resolvedPaths = @(Get-ClipboardCopyCandidatePaths)
+    }
 } catch {
     Write-Error $_
     return
