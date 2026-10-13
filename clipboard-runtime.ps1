@@ -124,7 +124,7 @@ function Await-WinRtOperation {
         }
     }
 
-    if (-not ($Operation.PSObject.Properties.Name -contains 'Status')) {
+    if ($null -eq $Operation.PSObject.Properties['Status']) {
         throw 'Clipboard async operation does not expose Status and could not be converted to a Task.'
     }
 
@@ -134,7 +134,7 @@ function Await-WinRtOperation {
 
     switch ($Operation.Status.ToString()) {
         'Completed' {
-            if ($Operation.PSObject.Methods.Name -contains 'GetResults') {
+            if ($null -ne $Operation.PSObject.Methods['GetResults']) {
                 return $Operation.GetResults()
             }
 
@@ -176,7 +176,120 @@ function Get-ClipboardHistoryItemsResult {
     return $result
 }
 
+function Get-ClipboardStorageItems {
+    param($DataPackageView)
+
+    $standardFormats = Get-WinRtType -TypeName 'Windows.ApplicationModel.DataTransfer.StandardDataFormats'
+    if ($null -eq $standardFormats -or -not $DataPackageView.Contains($standardFormats::StorageItems)) {
+        return @()
+    }
+
+    try {
+        # Avoid AsTask generic binding for IReadOnlyList<IStorageItem>; poll GetResults().
+        $items = Await-WinRtOperation -Operation ($DataPackageView.GetStorageItemsAsync())
+        return @($items)
+    } catch {
+        return @()
+    }
+}
+
+function Get-ClipboardStorageItemPaths {
+    param($DataPackageView)
+
+    $paths = @()
+    foreach ($item in @(Get-ClipboardStorageItems -DataPackageView $DataPackageView)) {
+        try {
+            if ($null -ne $item.Path -and -not [string]::IsNullOrWhiteSpace([string]$item.Path)) {
+                $paths += [string]$item.Path
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return @($paths)
+}
+
+function Invoke-ClipboardRetry {
+    param(
+        [scriptblock]$Action,
+        [int]$Attempts = 12
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            return & $Action
+        } catch {
+            $lastError = $_
+            Start-Sleep -Milliseconds (25 * $attempt)
+        }
+    }
+
+    throw $lastError
+}
+
+function Save-ActiveClipboardDataObject {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    return Invoke-ClipboardRetry -Action { [System.Windows.Forms.Clipboard]::GetDataObject() }
+}
+
+function Restore-ActiveClipboardDataObject {
+    param($DataObject)
+
+    if ($null -eq $DataObject) {
+        return
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    Invoke-ClipboardRetry -Action {
+        # Do not Clear() first: if SetDataObject fails afterward, Clear would
+        # leave the user with an empty clipboard.
+        [System.Windows.Forms.Clipboard]::SetDataObject($DataObject, $true)
+    } | Out-Null
+}
+
+function Get-ActiveClipboardFileDropPaths {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    return Invoke-ClipboardRetry -Action {
+        if (-not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+            return @()
+        }
+
+        return @([string[]][System.Windows.Forms.Clipboard]::GetFileDropList())
+    }
+}
+
+function Set-ClipboardHistoryItemAsContent {
+    param($HistoryItem)
+
+    $clipboardType = Get-ClipboardType
+    $status = Invoke-ClipboardRetry -Action { $clipboardType::SetHistoryItemAsContent($HistoryItem) }
+    if ($status.ToString() -ne 'Success') {
+        throw "SetHistoryItemAsContent failed with status '$status'."
+    }
+
+    return $status
+}
+
+function Get-ClipboardHistoryHiddenFilePaths {
+    param($HistoryItem)
+
+    # Windows Clipboard History often exposes Explorer copies as Text-only in
+    # DataPackageView.AvailableFormats. The Shell file handle is still stored and
+    # reappears as FileDrop/StorageItems only after SetHistoryItemAsContent.
+    Set-ClipboardHistoryItemAsContent -HistoryItem $HistoryItem | Out-Null
+    Start-Sleep -Milliseconds 20
+    return @(Get-ActiveClipboardFileDropPaths)
+}
+
 function Get-ClipboardHistoryEntries {
+    param(
+        # Probe Text history items via SetHistoryItemAsContent to discover hidden
+        # Explorer file handles. Temporarily replaces the active clipboard.
+        [switch]$ProbeFiles
+    )
+
     $standardFormats = Get-WinRtType -TypeName 'Windows.ApplicationModel.DataTransfer.StandardDataFormats'
     if ($null -eq $standardFormats) {
         throw 'Unable to load standard clipboard formats.'
@@ -187,26 +300,134 @@ function Get-ClipboardHistoryEntries {
     $index = 0
 
     foreach ($item in @($result.Items)) {
-        if ($item.Content.Contains($standardFormats::Text)) {
+        $hasStorageItems = $false
+        try {
+            $hasStorageItems = $item.Content.Contains($standardFormats::StorageItems)
+        } catch {
+            $hasStorageItems = $false
+        }
+
+        if ($hasStorageItems) {
+            $storagePaths = @(Get-ClipboardStorageItemPaths -DataPackageView $item.Content)
+            $entries += [pscustomobject]@{
+                Index   = $index
+                Type    = 'File'
+                Content = if ($storagePaths.Count -gt 0) { ($storagePaths -join [Environment]::NewLine) } else { $null }
+                Paths   = $storagePaths
+                Item    = $item
+                Id      = $item.Id
+            }
+        } elseif ($item.Content.Contains($standardFormats::Text)) {
             $entries += [pscustomobject]@{
                 Index   = $index
                 Type    = 'Text'
                 Content = [string](Await-WinRtOperation -Operation ($item.Content.GetTextAsync()) -ResultType ([string]))
+                Paths   = @()
                 Item    = $item
+                Id      = $item.Id
             }
         } elseif ($item.Content.Contains($standardFormats::Bitmap)) {
             $entries += [pscustomobject]@{
                 Index   = $index
                 Type    = 'Image'
                 Content = $null
+                Paths   = @()
                 Item    = $item
+                Id      = $item.Id
             }
         }
 
         $index++
     }
 
+    if (-not $ProbeFiles) {
+        return @($entries)
+    }
+
+    # Discover hidden Explorer file handles. Path-looking text stays Text unless
+    # promoting the history item actually rehydrates a FileDrop list.
+    $saved = $null
+    try {
+        $saved = Save-ActiveClipboardDataObject
+    } catch {
+        $saved = $null
+    }
+
+    try {
+        foreach ($entry in $entries) {
+            if ($entry.Type -ne 'Text') {
+                continue
+            }
+
+            try {
+                $paths = @(Get-ClipboardHistoryHiddenFilePaths -HistoryItem $entry.Item)
+            } catch {
+                continue
+            }
+
+            if ($paths.Count -eq 0) {
+                continue
+            }
+
+            $entry.Type = 'File'
+            $entry.Paths = $paths
+            $entry.Content = ($paths -join [Environment]::NewLine)
+        }
+    } finally {
+        try {
+            Restore-ActiveClipboardDataObject -DataObject $saved
+        } catch {
+            # Best-effort restore; probing may have replaced the active clipboard.
+        }
+    }
+
     return @($entries)
+}
+
+function Resolve-ClipboardSelection {
+    param(
+        [object[]]$Entries,
+        [string]$ParameterSetName,
+        [int[]]$Index,
+        [int[]]$Image,
+        [int[]]$File
+    )
+
+    switch ($ParameterSetName) {
+        'ByImage' {
+            $pool = @($Entries | Where-Object { $_.Type -eq 'Image' })
+            foreach ($ordinal in @($Image)) {
+                if ($ordinal -lt 0 -or $ordinal -ge $pool.Count) {
+                    Write-Error "Image ordinal $ordinal out of range. Available images: $($pool.Count) (absolute indexes: $((@($pool | ForEach-Object Index) -join ', ')))."
+                    continue
+                }
+
+                Write-Output $pool[$ordinal]
+            }
+        }
+        'ByFile' {
+            $pool = @($Entries | Where-Object { $_.Type -eq 'File' })
+            foreach ($ordinal in @($File)) {
+                if ($ordinal -lt 0 -or $ordinal -ge $pool.Count) {
+                    Write-Error "File ordinal $ordinal out of range. Available files: $($pool.Count) (absolute indexes: $((@($pool | ForEach-Object Index) -join ', ')))."
+                    continue
+                }
+
+                Write-Output $pool[$ordinal]
+            }
+        }
+        default {
+            foreach ($requestedIndex in @($Index)) {
+                $entry = $Entries | Where-Object { $_.Index -eq $requestedIndex } | Select-Object -First 1
+                if ($null -eq $entry) {
+                    Write-Error "Index $requestedIndex out of range. Use Get-ClipHistory.ps1 -All to list available items."
+                    continue
+                }
+
+                Write-Output $entry
+            }
+        }
+    }
 }
 
 function Get-ClipboardPreview {
@@ -250,8 +471,61 @@ function Get-ClipboardBitmapReference {
     return Await-WinRtOperation -Operation ($DataPackageView.GetBitmapAsync()) -ResultType $streamReferenceType
 }
 
+function ConvertTo-ToolFriendlyPngBytes {
+    param(
+        [System.Drawing.Image]$Image,
+        # Clipboard QR codes are often soft/small; rqrr needs more pixels.
+        [int]$MinEdge = 400,
+        [int]$MaxScale = 4
+    )
+
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+
+    $scale = 1
+    while (
+        $scale -lt $MaxScale -and
+        (($Image.Width * $scale) -lt $MinEdge) -and
+        (($Image.Height * $scale) -lt $MinEdge)
+    ) {
+        $scale++
+    }
+
+    $width = [Math]::Max(1, [int]($Image.Width * $scale))
+    $height = [Math]::Max(1, [int]($Image.Height * $scale))
+    $canvas = $null
+    $graphics = $null
+    $memoryStream = $null
+
+    try {
+        $canvas = New-Object System.Drawing.Bitmap $width, $height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($canvas)
+        $graphics.Clear([System.Drawing.Color]::White)
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+        $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
+        $graphics.DrawImage($Image, 0, 0, $width, $height)
+        $memoryStream = [System.IO.MemoryStream]::new()
+        $canvas.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
+        return $memoryStream.ToArray()
+    } finally {
+        if ($null -ne $graphics) {
+            $graphics.Dispose()
+        }
+
+        if ($null -ne $canvas) {
+            $canvas.Dispose()
+        }
+
+        if ($null -ne $memoryStream) {
+            $memoryStream.Dispose()
+        }
+    }
+}
+
 function Get-ClipboardBitmapPngBytes {
-    param($DataPackageView)
+    param(
+        $DataPackageView,
+        [switch]$ForTools
+    )
 
     $streamReference = Get-ClipboardBitmapReference -DataPackageView $DataPackageView
     if ($null -eq $streamReference) {
@@ -268,6 +542,11 @@ function Get-ClipboardBitmapPngBytes {
         Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
         $dotNetStream = Convert-ClipboardWinRtStreamToDotNetStream -Stream $stream
         $image = [System.Drawing.Image]::FromStream($dotNetStream)
+
+        if ($ForTools) {
+            return ConvertTo-ToolFriendlyPngBytes -Image $image
+        }
+
         $memoryStream = [System.IO.MemoryStream]::new()
         $image.Save($memoryStream, [System.Drawing.Imaging.ImageFormat]::Png)
         return $memoryStream.ToArray()
@@ -289,9 +568,17 @@ function Get-ClipboardBitmapPngBytes {
 function Show-ClipboardHistoryImage {
     param($DataPackageView)
 
-    $catimg = Get-Command -Name 'catimg' -ErrorAction SilentlyContinue
-    if ($null -eq $catimg) {
-        throw 'catimg is not available in PATH.'
+    # Prefer the imgcat/sixel-capable viewer names; they may all shim the same binary.
+    $viewer = $null
+    foreach ($name in @('imgcat', 'sixel', 'catimg')) {
+        $viewer = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $viewer) {
+            break
+        }
+    }
+
+    if ($null -eq $viewer) {
+        throw 'No terminal image viewer found in PATH (tried imgcat, sixel, catimg).'
     }
 
     $bytes = Get-ClipboardBitmapPngBytes -DataPackageView $DataPackageView
@@ -303,7 +590,7 @@ function Show-ClipboardHistoryImage {
 
     try {
         [IO.File]::WriteAllBytes($tempPath, $bytes)
-        & $catimg.Source $tempPath
+        & $viewer.Source $tempPath
     } finally {
         Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
     }
@@ -323,6 +610,21 @@ function Set-ClipboardFromHistoryEntry {
     switch ($Entry.Type) {
         'Text' {
             $package.SetText($Entry.Content)
+        }
+        'File' {
+            # History often hides Shell file handles until the item is promoted.
+            # SetHistoryItemAsContent rehydrates FileDrop / Shell IDList Array.
+            if ($null -ne $Entry.Item) {
+                Set-ClipboardHistoryItemAsContent -HistoryItem $Entry.Item | Out-Null
+                return $Entry
+            }
+
+            if ($Entry.Paths -and $Entry.Paths.Count -gt 0) {
+                [void](Set-ClipboardFileDropList -Path $Entry.Paths -Operation Copy)
+                return $Entry
+            }
+
+            throw "Clipboard history index $($Entry.Index) is a file entry but no history item/paths were available."
         }
         'Image' {
             $package.SetBitmap((Get-ClipboardBitmapReference -DataPackageView $Entry.Item.Content))
